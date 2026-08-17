@@ -1,9 +1,9 @@
-# Publish/Subscribe Demo — Market Ticker
+# Publish/Subscribe Demo — Payroll & Tax Processing
 
 A small, deliberately scoped solution demonstrating the Publish/Subscribe pattern in pure C#
-(.NET 8). It simulates a market data feed: raw price ticks come in, get transformed into an
-enriched update, and are broadcast to independent subscribers that each display the data
-differently.
+(.NET 8). It simulates a payroll run: raw payroll entries come in, get transformed into a
+payslip (gross pay, EPF, PCB, net pay), and are broadcast to independent subscribers that each
+do something different with the result.
 
 ## Running it
 
@@ -18,31 +18,32 @@ library. The test project uses xUnit, restored from NuGet in the usual way.
 ## The pipeline
 
 ```
-RawTick                    PriceUpdate                    subscribers
+RawPayrollEntry            PayslipResult                  subscribers
 (input)                    (transformed)                  (display)
 
 ┌────────────┐   Transform   ┌──────────────┐   Publish   ┌───────────────────────┐
-│ SampleTick  │ ───────────▶ │ PriceUpdate   │ ──────────▶ │ InMemoryEventBus<T>    │
-│ Source      │              │ Transformer   │             │ (broker / transport)   │
-└────────────┘               └──────────────┘             └───────────┬────────────┘
-                                     ▲                                 │ fan-out
-                              TickIngestor                             ▼
-                              (glues the two                ┌─────────────────────┐
-                               steps together)               │ ConsoleTickerSub.   │
-                                                              │ AlertSubscriber     │
-                                                              │ ...more, no changes  │
-                                                              │ needed elsewhere     │
-                                                              └─────────────────────┘
+│ SamplePay   │ ───────────▶ │ Payslip       │ ──────────▶ │ InMemoryEventBus<T>    │
+│ InputSource │              │ Calculator    │             │ (broker / transport)   │
+└────────────┘               └──────┬───────┘             └───────────┬────────────┘
+                                     │ delegates                       │ fan-out
+                              ITaxCalculator                           ▼
+                              (EPF is inline,                ┌─────────────────────┐
+                               PCB is its own seam)           │ ConsolePayslipSub.   │
+                                     ▲                        │ PayrollAnomalyAlert  │
+                              PayrollIngestor                 │ Subscriber           │
+                              (glues the two                  │ ...more, no changes  │
+                               steps together)                 │ needed elsewhere    │
+                                                                └─────────────────────┘
 ```
 
 | Requirement                         | Where it lives                                             |
 |--------------------------------------|-------------------------------------------------------------|
-| Take an input of data                | `RawTick` + `SampleTickSource` (App project)                 |
-| Transform that data                  | `PriceUpdateTransformer : IDataTransformer<RawTick, PriceUpdate>` |
+| Take an input of data                | `RawPayrollEntry` + `SamplePayInputSource` (App project)     |
+| Transform that data                  | `PayslipCalculator : IDataTransformer<RawPayrollEntry, PayslipResult>`, delegating tax to `ITaxCalculator` |
 | Transport to a set of subscribers    | `InMemoryEventBus<T> : IPublisher<T>, ISubscribable<T>`      |
-| Subscribers display the data         | `ConsoleTickerSubscriber`, `AlertSubscriber`                 |
+| Subscribers display the data         | `ConsolePayslipSubscriber`, `PayrollAnomalyAlertSubscriber`  |
 
-`TickIngestor` is the only class that knows about both the transform step and the publish
+`PayrollIngestor` is the only class that knows about both the transform step and the publish
 step; everything else only depends on interfaces (`IDataTransformer`, `IPublisher`,
 `ISubscribable`, `ISubscriber`).
 
@@ -52,19 +53,24 @@ step; everything else only depends on interfaces (`IDataTransformer`, `IPublishe
 src/PubSubDemo.Core/
   Abstractions/        ISubscriber<T>, IPublisher<T>, ISubscribable<T>, IDataTransformer<TIn,TOut>
   Messaging/            InMemoryEventBus<T>  – the broker
-  MarketData/            RawTick, PriceUpdate, Trend, PriceUpdateTransformer,
-                          TickIngestor, ConsoleTickerSubscriber, AlertSubscriber
-src/PubSubDemo.App/     Program.cs – wires everything together and runs a simulated stream
+  Payroll/               RawPayrollEntry, PayslipResult, PayTrend, ITaxCalculator,
+                          SimplifiedMonthlyTaxCalculator, PayslipCalculator,
+                          PayrollIngestor, ConsolePayslipSubscriber, PayrollAnomalyAlertSubscriber
+src/PubSubDemo.App/     Program.cs – wires everything together and runs a simulated payroll run
 tests/PubSubDemo.Core.Tests/   one test class per production class, plus small hand-rolled test doubles
 ```
 
 ## Design choices worth calling out
 
-- **Bus is generic and reusable.** `InMemoryEventBus<T>` doesn't know anything about market
-  data — it would work identically for order events, log lines, or anything else. Swapping it
-  for a real broker (Azure Service Bus, RabbitMQ, Kafka, SignalR) later only means writing a
-  new `IPublisher<T>` / `ISubscribable<T>` implementation; nothing that depends on those
-  interfaces has to change.
+- **Bus is generic and reusable.** `InMemoryEventBus<T>` doesn't know anything about payroll —
+  it would work identically for order events, log lines, or anything else. Swapping it for a
+  real broker (Azure Service Bus, RabbitMQ, Kafka, SignalR) later only means writing a new
+  `IPublisher<T>` / `ISubscribable<T>` implementation; nothing that depends on those interfaces
+  has to change.
+- **Tax calculation sits behind its own interface.** `PayslipCalculator` depends on
+  `ITaxCalculator` rather than computing PCB itself. Tax rules are the part of a payroll system
+  most likely to change — by jurisdiction, by tax year, by employee category — so that seam
+  keeps the swap local to one implementation instead of touching the ingestor or the bus.
 - **`Subscribe` returns `IDisposable`.** Idiomatic .NET (same shape as `IObservable<T>`),
   makes unsubscribing explicit, and plays nicely with `using` for scoped subscriptions.
 - **Publish takes a snapshot of subscribers before iterating.** A subscriber that
@@ -73,30 +79,35 @@ tests/PubSubDemo.Core.Tests/   one test class per production class, plus small h
 - **One subscriber's exception can't break delivery to the others.** Faults are isolated and
   reported through an optional callback rather than propagating — a genuine concern once you
   have more than one subscriber and don't want a bug in the alerting logic to also kill the
-  audit log.
-- **Transformer is stateful but self-contained.** It tracks last price per symbol, but that
-  state never leaks outside the class, so it's trivial to test without touching the bus at all.
+  console output.
+- **`PayslipCalculator` is stateful but self-contained.** It tracks last net pay per employee,
+  but that state never leaks outside the class, so it's trivial to test without touching the
+  bus at all.
 
 ## Testability
 
 Every piece is tested in isolation, using plain hand-rolled fakes rather than a mocking
-framework (deliberate — the seams are simple enough that a mocking library would be
-overhead, not clarity):
+framework (deliberate — the seams are simple enough that a mocking library would be overhead,
+not clarity):
 
-- `PriceUpdateTransformerTests` — pure input → output assertions, no bus involved.
-- `InMemoryEventBusTests` — fan-out to multiple subscribers, unsubscribe via `Dispose`,
-  fault isolation when one subscriber throws.
-- `TickIngestorTests` — a stub transformer and a recording publisher prove the ingestor calls
-  one then the other, without needing a real transform or a real bus.
-- `ConsoleTickerSubscriberTests` / `AlertSubscriberTests` — inject a `StringWriter` instead of
-  `Console.Out` so display output can be asserted without touching the real console.
+- `PayslipCalculatorTests` — pure input → output assertions against a stub `ITaxCalculator`,
+  no bus involved.
+- `SimplifiedMonthlyTaxCalculatorTests` — the tax bands in isolation, independent of payslip
+  calculation entirely.
+- `InMemoryEventBusTests` — fan-out to multiple subscribers, unsubscribe via `Dispose`, fault
+  isolation when one subscriber throws.
+- `PayrollIngestorTests` — a stub transformer and a recording publisher prove the ingestor
+  calls one then the other, without needing a real transform or a real bus.
+- `ConsolePayslipSubscriberTests` / `PayrollAnomalyAlertSubscriberTests` — inject a
+  `StringWriter` instead of `Console.Out` so display output can be asserted without touching
+  the real console.
 
 ## Talking points for the interview
 
 **What Pub/Sub buys you:** publishers and subscribers only share a message shape, not a
-reference to each other. You can add `AlertSubscriber` without touching `ConsoleTickerSubscriber`
-or the ingestor. You can run subscribers in parallel, add/remove them at runtime, or move the
-transport out-of-process, all without touching the producer.
+reference to each other. You can add `PayrollAnomalyAlertSubscriber` without touching
+`ConsolePayslipSubscriber` or the ingestor. You can run subscribers in parallel, add/remove
+them at runtime, or move the transport out-of-process, all without touching the producer.
 
 **What it costs:** a single synchronous in-memory bus like this one processes subscribers in
 sequence — a slow subscriber delays the others and eventually the publisher, unless you delegate
@@ -106,12 +117,17 @@ guaranteed delivery, ordering, or replay here; if that matters, that's exactly t
 thing a real broker (and much more code) buys you.
 
 **Extension points worth discussing live:**
-- Async subscribers (`Task OnMessageAsync(T message)`) for I/O-bound work, with a choice
-  between fire-and-forget, `Task.WhenAll`, or a bounded queue per subscriber.
+- Async subscribers (`Task OnMessageAsync(T message)`) for I/O-bound work, e.g. a subscriber
+  that writes payslips to a database or emails them out, with a choice between fire-and-forget,
+  `Task.WhenAll`, or a bounded queue per subscriber.
 - Swapping `InMemoryEventBus<T>` for a real broker behind the same interfaces.
-- Topic/type-based routing if subscribers only care about a subset of messages.
+- Swapping `SimplifiedMonthlyTaxCalculator` for a jurisdiction-compliant, versioned tax engine
+  behind the same `ITaxCalculator` interface — including how you'd handle a mid-year rate
+  change without reprocessing history incorrectly.
+- Topic/type-based routing if subscribers only care about a subset of messages (e.g. only
+  anomalies above a certain amount).
 - Backpressure/buffering if a subscriber is consistently slower than the publish rate.
-- Wiring this up through DI (`Microsoft.Extensions.DependencyInjection`) instead of the
-  manual composition in `Program.cs`, once there's more than a couple of components.
+- Wiring this up through DI (`Microsoft.Extensions.DependencyInjection`) instead of the manual
+  composition in `Program.cs`, once there's more than a couple of components.
 
 I kept the demo itself deliberately small — happy to sketch any of the above on a whiteboard.

@@ -1,24 +1,24 @@
 using PubSubDemo.App;
-using PubSubDemo.Core.MarketData;
 using PubSubDemo.Core.Messaging;
+using PubSubDemo.Core.Payroll;
 
-// 1) The broker. Generic, reusable, knows nothing about market data.
-var bus = new InMemoryEventBus<PriceUpdate>(
+// 1) The broker. Generic, reusable, knows nothing about payroll.
+var bus = new InMemoryEventBus<PayslipResult>(
     onSubscriberError: (subscriber, ex) =>
         Console.Error.WriteLine($"Subscriber {subscriber.GetType().Name} threw: {ex.Message}"));
 
-// 2) The pipeline: raw input -> transform -> publish.
-var ingestor = new TickIngestor(new PriceUpdateTransformer(), bus);
+// 2) The pipeline: raw input -> transform (EPF + PCB deductions) -> publish.
+var ingestor = new PayrollIngestor(new PayslipCalculator(new SimplifiedMonthlyTaxCalculator()), bus);
 
 // 3) Subscribers register independently of one another and of the ingestor.
-using var ticker = bus.Subscribe(new ConsoleTickerSubscriber());
-using var alerts = bus.Subscribe(new AlertSubscriber(thresholdPercent: 1.5m));
+using var payslips = bus.Subscribe(new ConsolePayslipSubscriber());
+using var anomalyAlerts = bus.Subscribe(new PayrollAnomalyAlertSubscriber(thresholdPercent: 15m));
 
-Console.WriteLine("Streaming simulated ticks (Ctrl+C to stop early)...\n");
+Console.WriteLine("Processing simulated payroll run (Ctrl+C to stop early)...\n");
 
-foreach (var tick in SampleTickSource.Generate(symbolCount: 3, ticksPerSymbol: 8, seed: 42))
+foreach (var entry in SamplePayInputSource.Generate(employeeCount: 3, payPeriods: 4, seed: 42))
 {
-    ingestor.Ingest(tick);
+    ingestor.Ingest(entry);
     await Task.Delay(150);
 }
 
